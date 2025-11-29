@@ -18,7 +18,7 @@ interoperates seamlessly with Rust programs.
 - Easily call Rust functions from within Datalog rules
 - Typesafe way to initialize `@input` relations
 - Very fast, compiled directly with the rest of your Rust code
-- **Provenance tracking**: trace how facts were derived (see [PROVENANCE.md](PROVENANCE.md))
+- **ProofTrace tracking**: trace how facts were derived (see [PROVENANCE.md](PROVENANCE.md))
 
 ## Example
 
@@ -63,9 +63,9 @@ node 2 can reach node 5
 node 3 can reach node 4
 ```
 
-## Provenance Tracking
+## ProofTrace Tracking
 
-Crepe supports provenance tracking to understand how facts were derived:
+Crepe supports proof_trace tracking to understand how facts were derived:
 
 ```rust
 use crepe::crepe;
@@ -85,15 +85,15 @@ fn main() {
     let mut runtime = Crepe::new();
     runtime.extend([Edge(1, 2), Edge(2, 3), Edge(3, 4)]);
 
-    // Use run_with_provenance() instead of run()
-    let (reachable, provenance) = runtime.run_with_provenance();
+    // Use run_with_proof_trace() instead of run()
+    let (reachable, proof_trace) = runtime.run_with_proof_trace();
     
     for Reachable(x, y) in reachable {
         println!("node {} can reach node {}", x, y);
     }
     
     // Explain how a fact was derived
-    let explanation = provenance.explain("Reachable(1, 4)");
+    let explanation = proof_trace.explain("Reachable(1, 4)");
     println!("\nHow was Reachable(1, 4) derived?");
     for fact in explanation {
         println!("  {}", fact);

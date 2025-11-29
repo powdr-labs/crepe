@@ -27,10 +27,10 @@ name = "fibonacci"
 harness = false
 
 [[example]]
-name = "basic_provenance"
+name = "basic_proof_trace"
 
 [[example]]
-name = "provenance_filtering"
+name = "proof_trace_filtering"
 
 [[example]]
 name = "comprehensive_test"
