@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Add provenance tracking**: New `run_with_provenance()` method to track how facts were derived
+  - Records which rules fired and which input facts were used
+  - Provides `Provenance` API with `explain()`, `filter_for_outputs()`, and `display()` methods
+  - Fully opt-in with zero overhead when not used
+  - See PROVENANCE.md for documentation
+
 ## 0.1.8 - 2023-03-19
 
 - Update syn dependency to v2.0

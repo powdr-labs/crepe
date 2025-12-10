@@ -26,6 +26,15 @@ harness = false
 name = "fibonacci"
 harness = false
 
+[[example]]
+name = "basic_proof_trace"
+
+[[example]]
+name = "proof_trace_filtering"
+
+[[example]]
+name = "comprehensive_test"
+
 [dev-dependencies]
 trybuild = "1.0.79"
 criterion = { version = "0.4.0", features = ["html_reports"] }

@@ -73,6 +73,11 @@ use strata::Strata;
 ///   containing the final derived @output structs.
 /// - `Crepe::run_with_hasher::<S: BuildHasher + Default>(self)`: similar to the
 ///   `run` method, but internally uses a custom hasher.
+/// - `Crepe::run_with_proof_trace(self)`: evaluates the Datalog program and
+///   returns both the output relations and a `ProofTrace` object that tracks
+///   which rules and facts led to each derived fact.
+/// - `Crepe::run_with_proof_trace_and_hasher::<S: BuildHasher + Default>(self)`:
+///   similar to `run_with_proof_trace`, but uses a custom hasher.
 ///
 /// In order for the engine to work, all relations must be tuple structs, and
 /// they automatically derive the `Eq`, `PartialEq`, `Hash`, `Copy`, and
@@ -537,7 +542,7 @@ impl Display for Index {
 }
 
 fn make_struct_decls(context: &Context) -> proc_macro2::TokenStream {
-    context
+    let relation_decls = context
         .all_relations()
         .map(|relation| {
             let attrs = &relation.attrs;
@@ -558,7 +563,171 @@ fn make_struct_decls(context: &Context) -> proc_macro2::TokenStream {
                 #(#attrs)*
                 #vis #struct_token #name #generics (#fields)#semi_token
             }
-        })
+        });
+    
+    // Add proof_trace tracking structures
+    let proof_trace_decls = quote! {
+        /// Tracks how facts were derived during Datalog evaluation
+        /// Uses ID-based tracking: each fact gets a unique ID
+        #[derive(Debug, Clone, Default)]
+        pub struct ProofTrace {
+            rule_descriptions: ::std::collections::HashMap<usize, String>,
+            rule_applications: ::std::collections::HashMap<usize, ::std::vec::Vec<(usize, ::std::vec::Vec<usize>)>>,
+        }
+        
+        impl ProofTrace {
+            fn new() -> Self {
+                Self::default()
+            }
+            
+            fn register_rule(&mut self, rule_id: usize, description: String) {
+                self.rule_descriptions.insert(rule_id, description);
+                self.rule_applications.insert(rule_id, ::std::vec::Vec::new());
+            }
+            
+            fn add_rule_application(&mut self, rule_id: usize, output_id: usize, input_ids: ::std::vec::Vec<usize>) {
+                self.rule_applications
+                    .entry(rule_id)
+                    .or_insert_with(::std::vec::Vec::new)
+                    .push((output_id, input_ids));
+            }
+            
+            pub fn get_rule_description(&self, rule_id: usize) -> Option<&str> {
+                self.rule_descriptions.get(&rule_id).map(|s| s.as_str())
+            }
+            
+            pub fn rule_applications(&self, rule_id: usize) -> &[(usize, ::std::vec::Vec<usize>)] {
+                self.rule_applications.get(&rule_id).map(|v| v.as_slice()).unwrap_or(&[])
+            }
+            
+            pub fn derivation_count(&self) -> usize {
+                self.rule_applications.values().map(|v| v.len()).sum()
+            }
+            
+            /// Returns all fact IDs involved in deriving this fact
+            pub fn explain(&self, fact_id: usize) -> ::std::vec::Vec<usize> {
+                let mut result = ::std::vec::Vec::new();
+                let mut visited = ::std::collections::HashSet::new();
+                let mut stack = vec![fact_id];
+                
+                while let Some(id) = stack.pop() {
+                    if visited.insert(id) {
+                        result.push(id);
+                        for apps in self.rule_applications.values() {
+                            for (out, inputs) in apps {
+                                if *out == id {
+                                    stack.extend(inputs.iter().filter(|i| !visited.contains(i)));
+                                }
+                            }
+                        }
+                    }
+                }
+                result
+            }
+            
+            /// Filter to only include facts needed to derive the given output fact IDs
+            pub fn filter_for_outputs(&self, output_ids: &[usize]) -> Self {
+                let needed: ::std::collections::HashSet<_> = output_ids.iter()
+                    .flat_map(|&id| self.explain(id))
+                    .collect();
+                
+                let filtered = self.rule_applications.iter()
+                    .filter_map(|(&rule_id, apps)| {
+                        let filtered_apps: ::std::vec::Vec<_> = apps.iter()
+                            .filter(|(out, _)| needed.contains(out))
+                            .cloned()
+                            .collect();
+                        (!filtered_apps.is_empty()).then(|| (rule_id, filtered_apps))
+                    })
+                    .collect();
+                
+                Self {
+                    rule_descriptions: self.rule_descriptions.clone(),
+                    rule_applications: filtered,
+                }
+            }
+            
+            /// Get fact IDs that are leaf outputs (not used as inputs)
+            pub fn get_output_fact_ids(&self) -> ::std::vec::Vec<usize> {
+                let mut outputs = ::std::collections::HashSet::new();
+                let mut inputs = ::std::collections::HashSet::new();
+                
+                for apps in self.rule_applications.values() {
+                    for (out, ins) in apps {
+                        outputs.insert(*out);
+                        inputs.extend(ins);
+                    }
+                }
+                outputs.difference(&inputs).copied().collect()
+            }
+            
+            /// Display detailed proof trace
+            pub fn display(&self) -> String {
+                let mut s = format!("ProofTrace Summary:\n\nTotal derivations: {}\n\nRules:\n", 
+                    self.derivation_count());
+                
+                let mut rules: ::std::vec::Vec<_> = self.rule_descriptions.iter().collect();
+                rules.sort_by_key(|(id, _)| *id);
+                
+                for (&id, desc) in &rules {
+                    let count = self.rule_applications.get(&id).map(|v| v.len()).unwrap_or(0);
+                    s.push_str(&format!("  Rule {} (fired {} times): {}\n", id, count, desc));
+                }
+                
+                s.push_str("\nRule Applications:\n");
+                for (&id, desc) in &rules {
+                    if let Some(apps) = self.rule_applications.get(&id) {
+                        if !apps.is_empty() {
+                            s.push_str(&format!("  Rule {}: {}\n", id, desc));
+                            for (out, ins) in apps {
+                                let inputs_str = ins.iter()
+                                    .map(|i| format!("#{}", i))
+                                    .collect::<::std::vec::Vec<_>>()
+                                    .join(", ");
+                                s.push_str(&format!("    Fact #{} <- [{}]\n", out, inputs_str));
+                            }
+                        }
+                    }
+                }
+                s
+            }
+            
+            /// Display compact format: fact_id [rule_id input_ids...]
+            pub fn display_compact(&self) -> String {
+                let mut derivations: ::std::collections::BTreeMap<usize, (usize, ::std::vec::Vec<usize>)> = 
+                    ::std::collections::BTreeMap::new();
+                
+                for (&rule_id, apps) in &self.rule_applications {
+                    for (out, ins) in apps {
+                        derivations.insert(*out, (rule_id, ins.clone()));
+                    }
+                }
+                
+                let mut all_ids = ::std::collections::BTreeSet::new();
+                for (out, ins) in derivations.values() {
+                    all_ids.insert(*out);
+                    all_ids.extend(ins);
+                }
+                
+                let mut s = String::new();
+                for id in all_ids {
+                    if let Some((rule, ins)) = derivations.get(&id) {
+                        s.push_str(&format!("{} {}", id, rule));
+                        for i in ins {
+                            s.push_str(&format!(" {}", i));
+                        }
+                        s.push('\n');
+                    } else {
+                        s.push_str(&format!("{}\n", id));
+                    }
+                }
+                s
+            }
+        }
+    };
+    
+    relation_decls
+        .chain(std::iter::once(proof_trace_decls))
         .collect()
 }
 
@@ -738,6 +907,45 @@ fn make_run(context: &Context) -> proc_macro2::TokenStream {
             .map(|(f, stratum)| f(make_updates(context, stratum, &indices)))
             .collect::<proc_macro2::TokenStream>()
     };
+    
+    let main_loops_with_proof_trace = {
+        let mut loop_wrappers = Vec::new();
+        for stratum in context.strata.iter() {
+            loop_wrappers.push(make_stratum_with_proof_trace(context, stratum, &mut indices.clone()));
+        }
+        loop_wrappers
+            .iter()
+            .zip(context.strata.iter())
+            .map(|(f, stratum)| f(make_updates(context, stratum, &indices)))
+            .collect::<proc_macro2::TokenStream>()
+    };
+    
+    // Generate rule registrations
+    let rule_registrations = context.rules.iter().enumerate().map(|(idx, rule)| {
+        let goal_name = &rule.goal.relation;
+        let rule_desc = format!("{} <- ...", goal_name);
+        quote! {
+            __crepe_proof_trace.register_rule(#idx, #rule_desc.to_string());
+        }
+    });
+    
+    // Generate per-rule proof_trace storage: just Vec<(usize, Vec<usize>)>
+    let rule_storage_inits = context.rules.iter().enumerate().map(|(idx, _rule)| {
+        let var_name = format_ident!("__crepe_rule_{}_proof_trace", idx);
+        quote! {
+            let mut #var_name: ::std::vec::Vec<(usize, ::std::vec::Vec<usize>)> = ::std::vec::Vec::new();
+        }
+    });
+    
+    // Collect per-rule storage into ProofTrace at the end
+    let rule_storage_collections = context.rules.iter().enumerate().map(|(idx, _rule)| {
+        let var_name = format_ident!("__crepe_rule_{}_proof_trace", idx);
+        quote! {
+            for (output_id, input_ids) in #var_name {
+                __crepe_proof_trace.add_rule_application(#idx, output_id, input_ids);
+            }
+        }
+    });
 
     let initialize = {
         let init_rels = context.all_relations().map(|rel| {
@@ -747,12 +955,18 @@ fn make_run(context: &Context) -> proc_macro2::TokenStream {
             let var_update = format_ident!("__{}_update", lower);
 
             quote! {
-                let mut #var: ::std::collections::HashSet<#rel_ty, CrepeHasher> =
-                    ::std::collections::HashSet::default();
-                let mut #var_update: ::std::collections::HashSet<#rel_ty, CrepeHasher> =
-                    ::std::collections::HashSet::default();
+                let mut #var: ::std::collections::HashMap<#rel_ty, usize, CrepeHasher> =
+                    ::std::collections::HashMap::default();
+                let mut #var_update: ::std::collections::HashMap<#rel_ty, usize, CrepeHasher> =
+                    ::std::collections::HashMap::default();
             }
         });
+        
+        // Global fact ID counter
+        let init_id_counter = quote! {
+            let mut __crepe_next_fact_id: usize = 0;
+        };
+        
         let init_indices = indices.iter().map(|index| {
             let rel = context
                 .get_relation(&index.name.to_string())
@@ -771,27 +985,52 @@ fn make_run(context: &Context) -> proc_macro2::TokenStream {
             let lower = to_lowercase(&rel.name);
             let var_update = format_ident!("__{}_update", lower);
             quote! {
-                #var_update.extend(self.#lower);
+                for fact in self.#lower {
+                    #var_update.insert(fact, __crepe_next_fact_id);
+                    __crepe_next_fact_id += 1;
+                }
             }
         });
-        init_rels
-            .chain(init_indices)
-            .chain(load_inputs)
-            .collect::<proc_macro2::TokenStream>()
+        
+        quote! {
+            #init_id_counter
+            #(#init_rels)*
+            #(#init_indices)*
+            #(#load_inputs)*
+        }
     };
 
     let output = {
         let output_fields = context.output_order.iter().map(|name| {
             let lower = to_lowercase(name);
-            format_ident!("__{}", lower)
+            let var = format_ident!("__{}", lower);
+            quote! {
+                #var.into_keys().collect()
+            }
         });
         quote! {
             (#(#output_fields,)*)
         }
     };
+    
+    let output_with_proof_trace = {
+        let output_fields = context.output_order.iter().map(|name| {
+            let lower = to_lowercase(name);
+            let var = format_ident!("__{}", lower);
+            quote! {
+                #var.into_keys().collect()
+            }
+        });
+        quote! {
+            (#(#output_fields,)* __crepe_proof_trace)
+        }
+    };
 
     let output_ty_hasher = make_output_ty(context, quote! { CrepeHasher });
     let output_ty_default = make_output_ty(context, quote! {});
+    let output_ty_proof_trace_hasher = make_output_ty_with_proof_trace(context, quote! { CrepeHasher });
+    let output_ty_proof_trace_default = make_output_ty_with_proof_trace(context, quote! {});
+    
     quote! {
         #[allow(clippy::collapsible_if)]
         fn run_with_hasher<CrepeHasher: ::std::hash::BuildHasher + ::core::default::Default>(
@@ -805,6 +1044,31 @@ fn make_run(context: &Context) -> proc_macro2::TokenStream {
         fn run(self) -> #output_ty_default {
             self.run_with_hasher::<::std::collections::hash_map::RandomState>()
         }
+        
+        #[allow(clippy::collapsible_if)]
+        fn run_with_proof_trace_and_hasher<CrepeHasher: ::std::hash::BuildHasher + ::core::default::Default>(
+            self
+        ) -> #output_ty_proof_trace_hasher {
+            let mut __crepe_proof_trace = ProofTrace::new();
+            
+            // Register all rule descriptions
+            #(#rule_registrations)*
+            
+            // Initialize per-rule proof_trace storage
+            #(#rule_storage_inits)*
+            
+            #initialize
+            #main_loops_with_proof_trace
+            
+            // Collect proof_trace from per-rule storage
+            #(#rule_storage_collections)*
+            
+            #output_with_proof_trace
+        }
+        
+        fn run_with_proof_trace(self) -> #output_ty_proof_trace_default {
+            self.run_with_proof_trace_and_hasher::<::std::collections::hash_map::RandomState>()
+        }
     }
 }
 
@@ -812,6 +1076,23 @@ fn make_stratum(
     context: &Context,
     stratum: &[Ident],
     indices: &mut HashSet<Index>,
+) -> Box<QuoteWrapper> {
+    make_stratum_impl(context, stratum, indices, false)
+}
+
+fn make_stratum_with_proof_trace(
+    context: &Context,
+    stratum: &[Ident],
+    indices: &mut HashSet<Index>,
+) -> Box<QuoteWrapper> {
+    make_stratum_impl(context, stratum, indices, true)
+}
+
+fn make_stratum_impl(
+    context: &Context,
+    stratum: &[Ident],
+    indices: &mut HashSet<Index>,
+    with_proof_trace: bool,
 ) -> Box<QuoteWrapper> {
     let stratum: HashSet<_> = stratum.iter().collect();
     let current_rels: Vec<_> = stratum
@@ -842,8 +1123,8 @@ fn make_stratum(
             let lower = to_lowercase(&rel.name);
             let rel_new = format_ident!("__{}_new", lower);
             quote! {
-                let mut #rel_new: ::std::collections::HashSet<#rel_ty, CrepeHasher> =
-                    ::std::collections::HashSet::default();
+                let mut #rel_new: ::std::collections::HashMap<#rel_ty, usize, CrepeHasher> =
+                    ::std::collections::HashMap::default();
             }
         })
         .collect();
@@ -851,8 +1132,15 @@ fn make_stratum(
     let rules: proc_macro2::TokenStream = context
         .rules
         .iter()
-        .filter(|rule| stratum.contains(&rule.goal.relation))
-        .map(|rule| make_rule(rule, &stratum, indices))
+        .enumerate()
+        .filter(|(_, rule)| stratum.contains(&rule.goal.relation))
+        .map(|(rule_idx, rule)| {
+            if with_proof_trace {
+                make_rule_with_proof_trace(rule, rule_idx, &stratum, indices)
+            } else {
+                make_rule(rule, &stratum, indices)
+            }
+        })
         .collect();
 
     let set_update_to_new: proc_macro2::TokenStream = current_rels
@@ -917,7 +1205,7 @@ fn make_updates(
                 ::std::vec::Vec<#rel_ty>,
                 CrepeHasher
             > = ::std::collections::HashMap::default();
-            for __crepe_var in &#rel_update {
+            for __crepe_var in #rel_update.keys() {
                 #index_name
                     .entry((#(__crepe_var.#bound_pos,)*))
                     .or_default()
@@ -937,18 +1225,52 @@ fn make_rule(
     stratum: &HashSet<&Ident>,
     indices: &mut HashSet<Index>,
 ) -> proc_macro2::TokenStream {
-    let goal = {
-        let relation = &rule.goal.relation;
-        let fields = &rule.goal.fields;
-        let name = format_ident!("__{}", to_lowercase(relation));
-        let name_new = format_ident!("__{}_new", to_lowercase(relation));
+    make_rule_impl(rule, 0, stratum, indices, false)
+}
+
+fn make_rule_with_proof_trace(
+    rule: &Rule,
+    rule_idx: usize,
+    stratum: &HashSet<&Ident>,
+    indices: &mut HashSet<Index>,
+) -> proc_macro2::TokenStream {
+    make_rule_impl(rule, rule_idx, stratum, indices, true)
+}
+
+fn make_rule_impl(
+    rule: &Rule,
+    rule_idx: usize,
+    stratum: &HashSet<&Ident>,
+    indices: &mut HashSet<Index>,
+    with_proof_trace: bool,
+) -> proc_macro2::TokenStream {
+    let goal_relation = &rule.goal.relation;
+    let goal_fields = &rule.goal.fields;
+    let name = format_ident!("__{}", to_lowercase(goal_relation));
+    let name_new = format_ident!("__{}_new", to_lowercase(goal_relation));
+    
+    let goal = if with_proof_trace {
+        let rule_storage = format_ident!("__crepe_rule_{}_proof_trace", rule_idx);
         quote! {
-            let __crepe_goal = #relation(#fields);
-            if !#name.contains(&__crepe_goal) {
-                #name_new.insert(__crepe_goal);
+            let __crepe_goal = #goal_relation(#goal_fields);
+            if !#name.contains_key(&__crepe_goal) {
+                let __crepe_output_id = __crepe_next_fact_id;
+                __crepe_next_fact_id += 1;
+                #name_new.insert(__crepe_goal, __crepe_output_id);
+                
+                // Store the derivation: (output_id, vec_of_input_ids)
+                #rule_storage.push((__crepe_output_id, __crepe_input_facts.clone()));
+            }
+        }
+    } else {
+        quote! {
+            let __crepe_goal = #goal_relation(#goal_fields);
+            if !#name.contains_key(&__crepe_goal) {
+                #name_new.insert(__crepe_goal, 0);  // ID doesn't matter without proof_trace
             }
         }
     };
+    
     let fact_positions: Vec<_> = rule
         .clauses
         .iter()
@@ -972,12 +1294,26 @@ fn make_rule(
             .clauses
             .iter()
             .cloned()
-            .map(|clause| make_clause(clause, false, &mut datalog_vars, indices))
+            .enumerate()
+            .map(|(i, clause)| {
+                make_clause(clause, false, &mut datalog_vars, indices, with_proof_trace, i == 0)
+            })
             .collect();
+        
         let eval_loop = fragments.into_iter().rev().fold(goal, |x, f| f(x));
-        quote! {
-            if __crepe_first_iteration {
-                #eval_loop
+        
+        if with_proof_trace {
+            quote! {
+                if __crepe_first_iteration {
+                    let mut __crepe_input_facts: ::std::vec::Vec<usize> = ::std::vec::Vec::new();
+                    #eval_loop
+                }
+            }
+        } else {
+            quote! {
+                if __crepe_first_iteration {
+                    #eval_loop
+                }
             }
         }
     } else {
@@ -992,11 +1328,20 @@ fn make_rule(
                 .cloned()
                 .enumerate()
                 .map(|(i, clause)| {
-                    make_clause(clause, update_position == i, &mut datalog_vars, indices)
+                    make_clause(clause, update_position == i, &mut datalog_vars, indices, with_proof_trace, i == 0)
                 })
                 .collect();
+            
             let eval_loop = fragments.into_iter().rev().fold(goal.clone(), |x, f| f(x));
-            variants.push(eval_loop);
+            
+            if with_proof_trace {
+                variants.push(quote! {
+                    let mut __crepe_input_facts: ::std::vec::Vec<usize> = ::std::vec::Vec::new();
+                    #eval_loop
+                });
+            } else {
+                variants.push(eval_loop);
+            }
         }
         variants.into_iter().collect()
     }
@@ -1007,6 +1352,8 @@ fn make_clause(
     only_update: bool,
     datalog_vars: &mut HashSet<String>,
     indices: &mut HashSet<Index>,
+    with_proof_trace: bool,
+    is_first_clause: bool,
 ) -> Box<QuoteWrapper> {
     match clause {
         Clause::Fact(fact) => {
@@ -1073,6 +1420,28 @@ fn make_clause(
                 }
             }
             let setters: proc_macro2::TokenStream = setters.into_iter().collect();
+            
+            let proof_trace_record = if with_proof_trace {
+                let lower = to_lowercase(name);
+                let rel_var = if only_update {
+                    format_ident!("__{}_update", lower)
+                } else {
+                    format_ident!("__{}", lower)
+                };
+                quote! {
+                    if let Some(&fact_id) = #rel_var.get(__crepe_var) {
+                        __crepe_input_facts.push(fact_id);
+                    }
+                }
+            } else {
+                quote! {}
+            };
+            
+            let clear_inputs = if with_proof_trace && is_first_clause {
+                quote! { __crepe_input_facts.clear(); }
+            } else {
+                quote! {}
+            };
 
             if !index_mode.contains(&IndexMode::Bound) {
                 let mut rel = format_ident!("__{}", &to_lowercase(name));
@@ -1082,8 +1451,10 @@ fn make_clause(
                 // If no fields are bound, we don't need an index
                 Box::new(move |body| {
                     quote_spanned! {fact.relation.span()=>
-                        for __crepe_var in &#rel {
+                        for __crepe_var in #rel.keys() {
+                            #clear_inputs
                             #setters
+                            #proof_trace_record
                             #body
                         }
                     }
@@ -1111,7 +1482,9 @@ fn make_clause(
                     quote_spanned! {fact.relation.span()=>
                         if let Some(__crepe_iter) = #index_name.get(&(#(#bound_fields,)*)) {
                             for __crepe_var in __crepe_iter {
+                                #clear_inputs
                                 #setters
+                                #proof_trace_record
                                 #body
                             }
                         }
@@ -1157,6 +1530,17 @@ fn make_output_ty(context: &Context, hasher: proc_macro2::TokenStream) -> proc_m
 
     quote! {
         (#(::std::collections::HashSet<#fields, #hasher>,)*)
+    }
+}
+
+fn make_output_ty_with_proof_trace(context: &Context, hasher: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    let fields = context.output_order.iter().map(|name| {
+        let rel = context.rels_output.get(&name.to_string()).unwrap();
+        relation_type(rel, LifetimeUsage::Item)
+    });
+
+    quote! {
+        (#(::std::collections::HashSet<#fields, #hasher>,)* ProofTrace)
     }
 }
 

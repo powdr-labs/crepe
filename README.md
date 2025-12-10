@@ -18,6 +18,7 @@ interoperates seamlessly with Rust programs.
 - Easily call Rust functions from within Datalog rules
 - Typesafe way to initialize `@input` relations
 - Very fast, compiled directly with the rest of your Rust code
+- **ProofTrace tracking**: trace how facts were derived (see [PROVENANCE.md](PROVENANCE.md))
 
 ## Example
 
@@ -61,6 +62,48 @@ node 2 can reach node 4
 node 2 can reach node 5
 node 3 can reach node 4
 ```
+
+## ProofTrace Tracking
+
+Crepe supports proof_trace tracking to understand how facts were derived:
+
+```rust
+use crepe::crepe;
+
+crepe! {
+    @input
+    struct Edge(i32, i32);
+
+    @output
+    struct Reachable(i32, i32);
+
+    Reachable(x, y) <- Edge(x, y);
+    Reachable(x, z) <- Edge(x, y), Reachable(y, z);
+}
+
+fn main() {
+    let mut runtime = Crepe::new();
+    runtime.extend([Edge(1, 2), Edge(2, 3), Edge(3, 4)]);
+
+    // Use run_with_proof_trace() instead of run()
+    let (reachable, proof_trace) = runtime.run_with_proof_trace();
+    
+    for Reachable(x, y) in reachable {
+        println!("node {} can reach node {}", x, y);
+    }
+    
+    // Explain how a fact was derived
+    let explanation = proof_trace.explain("Reachable(1, 4)");
+    println!("\nHow was Reachable(1, 4) derived?");
+    for fact in explanation {
+        println!("  {}", fact);
+    }
+}
+```
+
+For more details, see [PROVENANCE.md](PROVENANCE.md).
+
+## More Examples
 
 You can do much more with Crepe. The next example shows how you can use
 stratified negation, Rust expression syntax, and semi-naive evaluation to find
